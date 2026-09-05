@@ -42,6 +42,8 @@ class AvionMeshWebHandler : public AsyncWebHandler {
 
     bool canHandle(AsyncWebServerRequest *request) const override;
     void handleRequest(AsyncWebServerRequest *request) override;
+    void handleBody(AsyncWebServerRequest *request, uint8_t *data,
+                size_t len, size_t index, size_t total) override;
 
     void send_event(const char *event, const std::string &data);
     void sse_loop();
