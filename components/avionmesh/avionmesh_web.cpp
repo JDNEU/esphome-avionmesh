@@ -319,6 +319,59 @@ bool AvionMeshWebHandler::canHandle(AsyncWebServerRequest *request) const {
     return url == "/ui" || url.rfind("/api/", 0) == 0;
 }
 
+void AvionMeshWebHandler::handleBody(AsyncWebServerRequest *request,
+                                     uint8_t *data,
+                                     size_t len,
+                                     size_t index,
+                                     size_t total) {
+    // ESPHome ESP-IDF consumes raw POST bodies before handleRequest()
+    // and delivers them here in chunks.
+
+    if (index == 0) {
+        body_request_ = request;
+        request_body_.clear();
+        request_body_invalid_ = false;
+
+        ESP_LOGI(TAG, "handleBody: total=%zu", total);
+
+        if (total == 0 || total > MAX_REQUEST_BODY) {
+            ESP_LOGW(TAG, "handleBody: invalid body size=%zu", total);
+            request_body_invalid_ = true;
+            return;
+        }
+
+        request_body_.reserve(total);
+    }
+
+    if (body_request_ != request || request_body_invalid_) {
+        return;
+    }
+
+    // Ensure chunks arrive sequentially and do not exceed our limit.
+    if (index != request_body_.size() ||
+        index + len > MAX_REQUEST_BODY) {
+        ESP_LOGW(TAG,
+                 "handleBody: invalid chunk index=%zu len=%zu current=%zu",
+                 index, len, request_body_.size());
+
+        request_body_.clear();
+        request_body_invalid_ = true;
+        return;
+    }
+
+    request_body_.append(
+        reinterpret_cast<const char *>(data),
+        len
+    );
+
+    ESP_LOGD(TAG,
+             "handleBody: received=%zu/%zu",
+             request_body_.size(),
+             total);
+}
+
+
+
 void AvionMeshWebHandler::handleRequest(AsyncWebServerRequest *request) {
     std::string url = request->url();
     auto method = request->method();
@@ -366,35 +419,52 @@ void AvionMeshWebHandler::handleRequest(AsyncWebServerRequest *request) {
     } else {
         send_error(request, 404, "not_found");
     }
+	
+	// Clean up any buffered body that was not consumed by read_body().
+    if (body_request_ == request) {
+        body_request_ = nullptr;
+        request_body_.clear();
+        request_body_invalid_ = false;
+    }
 }
 
-std::string AvionMeshWebHandler::read_body(AsyncWebServerRequest *request) {
-    httpd_req_t *req = *request;
-    size_t len = req->content_len;
-    ESP_LOGI(TAG, "read_body: content_len=%zu", len);
+std::string AvionMeshWebHandler::read_body(
+    AsyncWebServerRequest *request) {
 
-    if (len == 0 || len > 16384) {  // 16KB limit for import requests
-        ESP_LOGW(TAG, "read_body: invalid len=%zu", len);
+    if (body_request_ != request) {
+        ESP_LOGW(TAG, "read_body: request does not match buffered body");
         return {};
     }
 
-    std::string body;
-    body.resize(len);
-    size_t total_read = 0;
+    if (request_body_invalid_) {
+        ESP_LOGW(TAG, "read_body: buffered body is invalid");
 
-    // Loop to read all data - ESPhttpd may not buffer everything at once
-    while (total_read < len) {
-        int ret = httpd_req_recv(req, &body[total_read], len - total_read);
-        ESP_LOGD(TAG, "read_body loop: recv=%d total=%zu", ret, total_read);
-        if (ret <= 0) {
-            ESP_LOGW(TAG, "read_body: recv error (ret=%d after %zu/%zu bytes)", ret, total_read, len);
-            return {};
-        }
-        total_read += ret;
+        body_request_ = nullptr;
+        request_body_.clear();
+        request_body_invalid_ = false;
+
+        return {};
     }
 
-    body.resize(total_read);
-    ESP_LOGI(TAG, "read_body: returning %zu bytes", total_read);
+    if (request_body_.empty()) {
+        ESP_LOGW(TAG, "read_body: buffered body is empty");
+
+        body_request_ = nullptr;
+        request_body_invalid_ = false;
+
+        return {};
+    }
+
+    std::string body = std::move(request_body_);
+
+    body_request_ = nullptr;
+    request_body_.clear();
+    request_body_invalid_ = false;
+
+    ESP_LOGI(TAG,
+             "read_body: returning %zu buffered bytes",
+             body.size());
+
     return body;
 }
 
