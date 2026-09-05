@@ -52,6 +52,13 @@ class AvionMeshWebHandler : public AsyncWebHandler {
  protected:
     AvionMeshHub *hub_;
 
+    // ESPHome delivers JSON POST bodies through handleBody() before handleRequest().
+    AsyncWebServerRequest *body_request_{nullptr};
+    std::string request_body_;
+    bool request_body_invalid_{false};
+
+static constexpr size_t MAX_REQUEST_BODY = 16384;
+
     std::vector<SseSession *> sse_sessions_;
     uint32_t last_state_read_ms_{0};
 
