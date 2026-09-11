@@ -116,12 +116,44 @@ void AvionMeshHub::gap_event_handler(esp_gap_ble_cb_event_t event,
                                       esp_ble_gap_cb_param_t *param) {
     switch (event) {
     case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
+        if (ble_state_ != BleState::Scanning || scan_phase_ != ScanPhase::Configuring)
+            break;
         if (param->scan_param_cmpl.status == ESP_BT_STATUS_SUCCESS) {
-            esp_ble_gap_start_scanning(SCAN_WINDOW_MS / 1000);
+            scan_phase_ = ScanPhase::Starting;
+            auto err = esp_ble_gap_start_scanning(SCAN_WINDOW_MS / 1000);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Scan start request failed: %d", err);
+                retry_scan();
+            }
         } else {
             ESP_LOGE(TAG, "Scan param set failed: %d", param->scan_param_cmpl.status);
-            ble_state_ = BleState::Disconnected;
-            reconnect_at_ms_ = esphome::millis() + RECONNECT_DELAY_MS;
+            retry_scan();
+        }
+        break;
+
+    case ESP_GAP_BLE_SCAN_START_COMPLETE_EVT:
+        if (ble_state_ != BleState::Scanning || scan_phase_ != ScanPhase::Starting)
+            break;
+        if (param->scan_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGW(TAG, "Scan start failed: %d", param->scan_start_cmpl.status);
+            retry_scan();
+        } else {
+            scan_phase_ = ScanPhase::Running;
+            scan_start_ms_ = esphome::millis();
+            scan_timeout_seen_ = false;
+        }
+        break;
+
+    case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
+        if (ble_state_ != BleState::Scanning || scan_phase_ != ScanPhase::Stopping)
+            break;
+        if (param->scan_stop_cmpl.status == ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGW(TAG, "Stalled scan stopped; scheduling a fresh scan");
+            retry_scan();
+        } else {
+            ESP_LOGE(TAG, "Scan stop failed: %d; rebooting to recover BLE",
+                     param->scan_stop_cmpl.status);
+            esphome::App.reboot();
         }
         break;
 
@@ -133,6 +165,14 @@ void AvionMeshHub::gap_event_handler(esp_gap_ble_cb_event_t event,
 void AvionMeshHub::gap_scan_event_handler(
         const esphome::esp32_ble::BLEScanResult &result) {
     if (result.search_evt == ESP_GAP_SEARCH_INQ_CMPL_EVT) {
+        if (ble_state_ != BleState::Scanning)
+            return;
+        if (scan_phase_ == ScanPhase::Stopping) {
+            retry_scan();
+            return;
+        }
+        if (scan_phase_ != ScanPhase::Running && scan_phase_ != ScanPhase::Starting)
+            return;
         ESP_LOGD(TAG, "Scan complete");
         stop_scan_and_connect();
         return;
@@ -140,7 +180,8 @@ void AvionMeshHub::gap_scan_event_handler(
 
     if (result.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT)
         return;
-    if (ble_state_ != BleState::Scanning)
+    if (ble_state_ != BleState::Scanning ||
+        (scan_phase_ != ScanPhase::Starting && scan_phase_ != ScanPhase::Running))
         return;
 
     /* Parse advertisement data for 0xFEF1 service UUID */
@@ -184,34 +225,91 @@ void AvionMeshHub::gap_scan_event_handler(
 /* ---- GAP scanning ---- */
 
 void AvionMeshHub::start_scan() {
-    ble_state_ = BleState::Scanning;
+    scan_phase_ = ScanPhase::Configuring;
+    scan_timeout_seen_ = false;
     best_rssi_ = -999;
     std::memset(bridge_bda_, 0, sizeof(bridge_bda_));
     scan_start_ms_ = esphome::millis();
+    set_ble_state(BleState::Scanning);
     ESP_LOGI(TAG, "Scanning for CSRMesh bridges...");
 
-    esp_ble_scan_params_t scan_params = {};
-    scan_params.scan_type = BLE_SCAN_TYPE_ACTIVE;
-    scan_params.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
-    scan_params.scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL;
-    scan_params.scan_interval = 0x50;  // 50ms
-    scan_params.scan_window = 0x30;    // 30ms
-    scan_params.scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE;
+    // Keep the parameters alive until the asynchronous completion callback.
+    scan_params_ = {};
+    scan_params_.scan_type = BLE_SCAN_TYPE_ACTIVE;
+    scan_params_.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
+    scan_params_.scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL;
+    scan_params_.scan_interval = 0x50;  // 50ms
+    scan_params_.scan_window = 0x30;    // 30ms
+    scan_params_.scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE;
 
-    esp_ble_gap_set_scan_params(&scan_params);
+    auto err = esp_ble_gap_set_scan_params(&scan_params_);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Scan parameter request failed: %d", err);
+        retry_scan();
+    }
+}
+
+void AvionMeshHub::set_ble_state(BleState state) {
+    ble_state_ = state;
+    update_mesh_initialized();
+}
+
+void AvionMeshHub::retry_scan() {
+    scan_phase_ = ScanPhase::Idle;
+    scan_timeout_seen_ = false;
+    reconnect_at_ms_ = esphome::millis() + RECONNECT_DELAY_MS;
+    set_ble_state(BleState::Disconnected);
+}
+
+void AvionMeshHub::service_ble_recovery() {
+    const uint32_t now = esphome::millis();
+    if (ble_state_ == BleState::Disconnected) {
+        // Signed subtraction makes the short retry deadline safe at millis rollover.
+        if (static_cast<int32_t>(now - reconnect_at_ms_) >= 0)
+            start_scan();
+        return;
+    }
+    if (ble_state_ != BleState::Scanning)
+        return;
+
+    const uint32_t timeout = scan_phase_ == ScanPhase::Stopping
+                                 ? SCAN_STOP_WATCHDOG_MS : SCAN_WATCHDOG_MS;
+    if (static_cast<uint32_t>(now - scan_start_ms_) < timeout)
+        return;
+    // Let esp32_ble drain its queued completion events for one more loop pass.
+    if (!scan_timeout_seen_) {
+        scan_timeout_seen_ = true;
+        return;
+    }
+    if (scan_phase_ == ScanPhase::Stopping) {
+        ESP_LOGE(TAG, "BLE scan stop timed out; rebooting to recover BLE");
+        esphome::App.reboot();
+        return;
+    }
+
+    ESP_LOGW(TAG, "BLE scan watchdog expired; stopping stalled scan");
+    scan_phase_ = ScanPhase::Stopping;
+    scan_start_ms_ = now;
+    scan_timeout_seen_ = false;
+    auto err = esp_ble_gap_stop_scanning();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Scan stop request failed: %d; rebooting to recover BLE", err);
+        esphome::App.reboot();
+    }
 }
 
 void AvionMeshHub::stop_scan_and_connect() {
     if (ble_state_ != BleState::Scanning)
         return;
+    scan_phase_ = ScanPhase::Idle;
+    scan_timeout_seen_ = false;
     connect_to_best();
 }
 
 void AvionMeshHub::connect_to_best() {
     if (best_rssi_ == -999) {
         ESP_LOGW(TAG, "No CSRMesh bridges found, retrying in %ums", RECONNECT_DELAY_MS);
-        ble_state_ = BleState::Disconnected;
-        reconnect_at_ms_ = esphome::millis() + RECONNECT_DELAY_MS;
+        retry_scan();
         return;
     }
 
@@ -221,8 +319,12 @@ void AvionMeshHub::connect_to_best() {
              bridge_bda_[3], bridge_bda_[4], bridge_bda_[5]);
     ESP_LOGI(TAG, "Connecting to best bridge: %s (RSSI=%d)", addr_str, best_rssi_);
 
-    ble_state_ = BleState::Connecting;
-    esp_ble_gattc_open(gattc_if_, bridge_bda_, BLE_ADDR_TYPE_PUBLIC, true);
+    set_ble_state(BleState::Connecting);
+    auto err = esp_ble_gattc_open(gattc_if_, bridge_bda_, BLE_ADDR_TYPE_PUBLIC, true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "BLE connection request failed: %d", err);
+        on_disconnected();
+    }
 }
 
 /* ---- GATTC event handler (dispatched by esp32_ble) ---- */
@@ -316,7 +418,7 @@ void AvionMeshHub::gattc_event_handler(esp_gattc_cb_event_t event,
 void AvionMeshHub::on_connected(esp_gatt_if_t gattc_if, uint16_t conn_id) {
     conn_id_ = conn_id;
     gattc_if_ = gattc_if;
-    ble_state_ = BleState::Discovering;
+    set_ble_state(BleState::Discovering);
     ESP_LOGI(TAG, "BLE connected, discovering services...");
     esp_ble_gattc_search_service(gattc_if, conn_id, nullptr);
 }
@@ -350,10 +452,8 @@ void AvionMeshHub::on_service_discovery_complete() {
         esp_ble_gattc_register_for_notify(gattc_if_, bridge_bda_, char_low_handle_);
         esp_ble_gattc_register_for_notify(gattc_if_, bridge_bda_, char_high_handle_);
 
-        ble_state_ = BleState::Ready;
-        /* Mesh is now fully operational (crypto + BLE connected) */
-        mesh_initialized_ = true;
-        ESP_LOGI(TAG, "BLE ready - mesh operational");
+        set_ble_state(BleState::Ready);
+        ESP_LOGI(TAG, "BLE ready (mesh initialized=%s)", mesh_initialized_ ? "YES" : "NO");
     } else {
         ESP_LOGE(TAG, "CSRMesh characteristics not found (LOW=0x%04X HIGH=0x%04X)",
                  char_low_handle_, char_high_handle_);
@@ -374,9 +474,7 @@ void AvionMeshHub::on_disconnected() {
         csrmesh::associate_cancel(mesh_ctx_);
     }
 
-    ble_state_ = BleState::Disconnected;
-    reconnect_at_ms_ = esphome::millis() + RECONNECT_DELAY_MS;
-    update_mesh_initialized();
+    retry_scan();
     ESP_LOGI(TAG, "Will reconnect in %ums", RECONNECT_DELAY_MS);
 }
 
@@ -422,7 +520,8 @@ void AvionMeshHub::update_mesh_initialized() {
                  crypto_initialized_, static_cast<int>(ble_state_));
     }
 
-    if (mesh_initialized_ != was_initialized) {
+    if (mesh_initialized_ != was_initialized || ble_state_ != published_ble_state_) {
+        published_ble_state_ = ble_state_;
         char buf[128];
         snprintf(buf, sizeof(buf),
                  "{\"ble_state\":%u,\"mesh_initialized\":%s,\"rx_count\":%u}",
@@ -477,10 +576,8 @@ void AvionMeshHub::loop() {
         esp_ble_gattc_app_register(0);
     }
 
-    if (ble_state_ == BleState::Disconnected &&
-        esphome::millis() >= reconnect_at_ms_) {
-        start_scan();
-    }
+    if (gattc_registered_ && esphome::esp32_ble::global_ble->is_active())
+        service_ble_recovery();
 
     if (!mgmt_subscribed_) {
         auto *mqtt = esphome::mqtt::global_mqtt_client;
@@ -1332,7 +1429,7 @@ void AvionMeshHub::handle_set_passphrase(const std::string &passphrase) {
 
     /* Trigger reconnection if disconnected */
     if (ble_state_ == BleState::Disconnected || ble_state_ == BleState::Idle) {
-        ble_state_ = BleState::Disconnected;
+        set_ble_state(BleState::Disconnected);
         reconnect_at_ms_ = esphome::millis();  /* Reconnect immediately */
         ESP_LOGI(TAG, "Triggering BLE reconnection after passphrase set");
     }
@@ -1363,7 +1460,7 @@ void AvionMeshHub::handle_generate_passphrase() {
 
     /* Trigger reconnection if disconnected */
     if (ble_state_ == BleState::Disconnected || ble_state_ == BleState::Idle) {
-        ble_state_ = BleState::Disconnected;
+        set_ble_state(BleState::Disconnected);
         reconnect_at_ms_ = esphome::millis();  /* Reconnect immediately */
         ESP_LOGI(TAG, "Triggering BLE reconnection after passphrase generated");
     }
