@@ -92,10 +92,17 @@ class AvionMeshHub : public esphome::Component {
 
     /* BLE connection management */
     BleState ble_state_{BleState::Idle};
+    BleState published_ble_state_{BleState::Idle};
+    enum class ScanPhase : uint8_t { Idle, Configuring, Starting, Running, Stopping };
+    ScanPhase scan_phase_{ScanPhase::Idle};
+    esp_ble_scan_params_t scan_params_{};
+    bool scan_timeout_seen_{false};
     esp_bd_addr_t bridge_bda_{};
     int best_rssi_{-999};
     uint32_t scan_start_ms_{0};
     static constexpr uint32_t SCAN_WINDOW_MS = 5000;
+    static constexpr uint32_t SCAN_WATCHDOG_MS = 15000;
+    static constexpr uint32_t SCAN_STOP_WATCHDOG_MS = 5000;
     static constexpr uint32_t RECONNECT_DELAY_MS = 3000;
     uint32_t reconnect_at_ms_{0};
 
@@ -172,6 +179,9 @@ class AvionMeshHub : public esphome::Component {
     /* GAP scanning */
     void start_scan();
     void stop_scan_and_connect();
+    void retry_scan();
+    void service_ble_recovery();
+    void set_ble_state(BleState state);
 
     /* GATTC connection */
     void connect_to_best();
