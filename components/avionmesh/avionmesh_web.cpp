@@ -486,7 +486,7 @@ void AvionMeshWebHandler::handle_index(AsyncWebServerRequest *request) {
     auto *response = request->beginResponse(200, "text/html",
                                              AVIONMESH_WEB_HTML, AVIONMESH_WEB_HTML_SIZE);
     response->addHeader("Content-Encoding", "gzip");
-    response->addHeader("Cache-Control", "public, max-age=3600");
+    response->addHeader("Cache-Control", "no-store");
     request->send(response);
 }
 
