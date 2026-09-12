@@ -73,13 +73,11 @@ function renderDevices() {
     return;
   }
   grid.innerHTML = devices.map(d => deviceCard(d)).join('');
+  updateDeviceButtons();
 }
 
 function deviceCard(d) {
-  const knownBri = d.brightness !== undefined;
-  const on = knownBri && d.brightness > 0;
-  const stateText = knownBri ? (on ? `ON · ${d.brightness}` : 'OFF') : '';
-  const stateClass = knownBri ? (on ? 'on' : 'off') : 'unknown';
+  const knownBri = Number.isInteger(d.brightness) && d.brightness >= 0 && d.brightness <= 255;
   const hasDim = d.has_dimming !== false;
   const hasCT  = d.has_color_temp === true;
   const ctVal  = d.color_temp ?? 2700;
@@ -95,11 +93,11 @@ function deviceCard(d) {
       <div class="card-name">${esc(d.name)}</div>
       <div class="card-sub">${esc(d.product_name)} · #${d.avion_id}</div>
     </div>
-    <span id="stPill${d.avion_id}" class="state-pill ${stateClass}">${stateText}</span>
+    <span id="stPill${d.avion_id}" class="state-pill" role="status">Unknown</span>
   </div>
   <div class="on-off">
-    <button class="sm ghost" onclick="ctrlDev(${d.avion_id},255)">On</button>
-    <button class="sm ghost" onclick="ctrlDev(${d.avion_id},0)">Off</button>
+    <button id="devon${d.avion_id}" class="sm ghost" disabled onclick="ctrlDev(${d.avion_id},255)">On</button>
+    <button id="devoff${d.avion_id}" class="sm ghost" disabled onclick="ctrlDev(${d.avion_id},0)">Off</button>
     <label class="toggle-row">
       <span class="toggle">
         <input type="checkbox" ${d.mqtt_exposed ? 'checked' : ''} onchange="toggleMqtt(${d.avion_id},this.checked,this)">
@@ -140,13 +138,34 @@ function deviceCard(d) {
 </div>`;
 }
 
-function applyDeviceState(d) {
-  const on = d.brightness > 0;
-  const pill = $('stPill' + d.avion_id);
-  if (pill) {
-    pill.textContent = on ? `ON · ${d.brightness}` : 'OFF';
-    pill.className = 'state-pill ' + (on ? 'on' : 'off');
+function updateDeviceButtons(device = null) {
+  const ready = sseConnected && sseSynced && bleState === 4;
+  for (const d of device ? [device] : devices) {
+    const known = Number.isInteger(d.brightness) && d.brightness >= 0 && d.brightness <= 255;
+    const state = ready && known ? (d.brightness > 0 ? 'on' : 'off') : 'unknown';
+    for (const command of ['on', 'off']) {
+      const button = $('dev' + command + d.avion_id);
+      if (!button) continue;
+      button.className = 'sm' + (state === command ? '' : ' ghost');
+      // On also requests full brightness, so keep both commands available.
+      button.disabled = !ready;
+    }
+    const pill = $('stPill' + d.avion_id);
+    if (pill) {
+      pill.textContent = !sseConnected ? 'Unavailable'
+        : !sseSynced ? 'Loading…'
+        : bleState !== 4 ? 'Unavailable'
+        : !known ? 'Unknown'
+        : state === 'on' ? `ON · ${d.brightness}` : 'OFF';
+      // Unknown and unavailable must remain visible (CSS hides .unknown).
+      pill.className = 'state-pill' + (ready && known ? ' ' + state : '');
+      pill.title = 'Last known state; individual device availability is not reported.';
+    }
   }
+}
+
+function applyDeviceState(d) {
+  updateDeviceButtons(d);
   const bvEl = $('bv' + d.avion_id);
   const bri = document.querySelector(`.card[data-avid="${d.avion_id}"] .bri-range`);
   if (bri !== document.activeElement) {
@@ -288,6 +307,7 @@ function connectSSE() {
     bleState = 0;
     devices = [];
     groups = [];
+    renderDevices();
     renderGroups();
     updateStatusBar();
     feedLog('SSE connected');
@@ -297,6 +317,7 @@ function connectSSE() {
     $('sseDot').className = 'sse-dot sse-off';
     sseConnected = false;
     sseSynced = false;
+    updateDeviceButtons();
     updateGroupButtons();
   };
 
@@ -305,6 +326,7 @@ function connectSSE() {
     bleState = d.ble_state;
     $('rxCount').textContent = d.rx_count;
     updateStatusBar();
+    updateDeviceButtons();
     updateGroupButtons();
   });
 
