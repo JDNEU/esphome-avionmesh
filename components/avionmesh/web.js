@@ -4,6 +4,7 @@ let meshMqttExposed = false;
 let unassocHashes = [];
 let claimingHash = null;
 let evtSource = null;
+let sseConnected = false, sseSynced = false;
 
 const BLE_NAMES = ['Idle', 'Scanning', 'Connecting', 'Discovering', 'Ready', 'Disconnected'];
 const PRODUCTS = [
@@ -163,10 +164,50 @@ function applyDeviceState(d) {
 }
 
 /* ── Group cards ─────────────────────────── */
+function groupPowerState(g) {
+  // Use individual members, not the hub's inferred group-command state.
+  const members = g.group_id === 0
+    ? devices
+    : g.members.map(mid => devices.find(d => d.avion_id === mid));
+  if (!members.length || members.some(d => !d ||
+      !Number.isInteger(d.brightness) || d.brightness < 0 || d.brightness > 255)) {
+    return 'unknown';
+  }
+  if (members.every(d => d.brightness === 0)) return 'off';
+  if (members.every(d => d.brightness > 0)) return 'on';
+  return 'mixed';
+}
+
+function updateGroupButtons() {
+  const ready = sseConnected && sseSynced && bleState === 4;
+  const labels = {
+    on: 'Last known: All on', off: 'Last known: All off',
+    mixed: 'Last known: Mixed', unknown: 'Unknown'
+  };
+  for (const g of [{group_id: 0}, ...groups]) {
+    const state = ready ? groupPowerState(g) : 'unknown';
+    for (const command of ['on', 'off']) {
+      const button = $('grp' + command + g.group_id);
+      if (!button) continue;
+      button.className = 'sm' + (state === command ? '' : ' ghost');
+      // Both commands remain useful: On also requests full brightness.
+      button.disabled = !ready;
+    }
+    const status = $('grpStatus' + g.group_id);
+    if (status) {
+      status.textContent = !sseConnected ? 'Unavailable'
+        : !sseSynced ? 'Loading…'
+        : bleState !== 4 ? 'Unavailable'
+        : labels[state];
+    }
+  }
+}
+
 function renderGroups() {
   const grid = $('groupGrid');
   const all = {group_id: 0, name: 'All (Broadcast)', members: [], mqtt_exposed: meshMqttExposed};
   grid.innerHTML = [all, ...groups].map(g => groupCard(g)).join('');
+  updateGroupButtons();
 }
 
 function groupCard(g) {
@@ -186,10 +227,11 @@ function groupCard(g) {
   <div>
     <div class="card-name">${esc(g.name)}</div>
     <div class="card-sub">Group · #${g.group_id}</div>
+    <div id="grpStatus${g.group_id}" class="card-sub" role="status">Unknown</div>
   </div>
   <div class="on-off">
-    <button class="sm" onclick="ctrlDev(${g.group_id},255)">On</button>
-    <button class="sm ghost" onclick="ctrlDev(${g.group_id},0)">Off</button>
+    <button id="grpon${g.group_id}" class="sm ghost" disabled onclick="ctrlDev(${g.group_id},255)">On</button>
+    <button id="grpoff${g.group_id}" class="sm ghost" disabled onclick="ctrlDev(${g.group_id},0)">Off</button>
   </div>
   <label class="toggle-row">
     <span class="toggle">
@@ -241,13 +283,21 @@ function connectSSE() {
 
   evtSource.onopen = () => {
     $('sseDot').className = 'sse-dot sse-on';
+    sseConnected = true;
+    sseSynced = false;
+    bleState = 0;
     devices = [];
     groups = [];
+    renderGroups();
+    updateStatusBar();
     feedLog('SSE connected');
   };
 
   evtSource.onerror = () => {
     $('sseDot').className = 'sse-dot sse-off';
+    sseConnected = false;
+    sseSynced = false;
+    updateGroupButtons();
   };
 
   evtSource.addEventListener('meta', e => {
@@ -255,6 +305,7 @@ function connectSSE() {
     bleState = d.ble_state;
     $('rxCount').textContent = d.rx_count;
     updateStatusBar();
+    updateGroupButtons();
   });
 
   evtSource.addEventListener('devices', e => {
@@ -264,6 +315,7 @@ function connectSSE() {
     });
     updateStatusBar();
     renderDevices();
+    updateGroupButtons();
   });
 
   evtSource.addEventListener('groups', e => {
@@ -276,6 +328,7 @@ function connectSSE() {
   });
 
   evtSource.addEventListener('sync_complete', () => {
+    sseSynced = true;
     feedLog(`Sync: ${devices.length} devices, ${groups.length} groups`);
     updateStatusBar();
     renderDevices();
@@ -288,6 +341,7 @@ function connectSSE() {
     if (i >= 0) devices[i] = d; else devices.push(d);
     updateStatusBar();
     renderDevices();
+    updateGroupButtons();
     feedLog('Device added: ' + d.name);
   });
 
@@ -374,6 +428,8 @@ function connectSSE() {
       dev.brightness = d.brightness;
       if (d.color_temp !== undefined) dev.color_temp = d.color_temp;
       applyDeviceState(d);
+      // Update status in place so reports do not reset open group controls.
+      updateGroupButtons();
     }
     const name = dev ? dev.name : '#' + d.avion_id;
     feedLog(name + ': bri=' + d.brightness + (d.color_temp !== undefined ? ' ct=' + d.color_temp + 'K' : ''));
